@@ -47,8 +47,26 @@ class Repository:
                     details TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS plan_changes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    record_id INTEGER NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+                    status TEXT NOT NULL,
+                    new_payment REAL NOT NULL,
+                    new_remaining_months INTEGER NOT NULL,
+                    reason TEXT NOT NULL,
+                    effective_date TEXT NOT NULL,
+                    requested_by TEXT NOT NULL,
+                    decided_by TEXT,
+                    decision_note TEXT,
+                    before_payment REAL NOT NULL,
+                    before_remaining_months INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    decided_at TEXT
+                );
                 CREATE INDEX IF NOT EXISTS idx_records_state ON records(state);
                 CREATE INDEX IF NOT EXISTS idx_audit_record ON audit_events(record_id, id);
+                CREATE INDEX IF NOT EXISTS idx_plan_changes_record ON plan_changes(record_id, id);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_plan_changes_pending ON plan_changes(record_id) WHERE status='pending';
                 """
             )
 
@@ -125,6 +143,98 @@ class Repository:
                 "INSERT INTO audit_events(record_id,action,actor_id,version,details,created_at) VALUES(?,?,?,?,?,?)",
                 (record_id, action, actor_id, int(row["version"]), json.dumps(details, ensure_ascii=False, sort_keys=True), _now()),
             )
+
+    def create_plan_change(self, record_id: int, prepared: Dict[str, Any], actor_id: str, audit_details: Dict[str, Any]) -> Dict[str, Any]:
+        now = _now()
+        try:
+            with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute("SELECT version FROM records WHERE id=?", (record_id,)).fetchone()
+                if row is None:
+                    connection.rollback()
+                    raise NotFound("记录不存在")
+                cursor = connection.execute(
+                    "INSERT INTO plan_changes(record_id,status,new_payment,new_remaining_months,reason,effective_date,requested_by,before_payment,before_remaining_months,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        record_id,
+                        "pending",
+                        prepared["new_payment"],
+                        prepared["new_remaining_months"],
+                        prepared["reason"],
+                        prepared["effective_date"],
+                        actor_id,
+                        prepared["before_payment"],
+                        prepared["before_remaining_months"],
+                        now,
+                    ),
+                )
+                change_id = int(cursor.lastrowid)
+                details = dict(audit_details)
+                details["change_id"] = change_id
+                connection.execute(
+                    "INSERT INTO audit_events(record_id,action,actor_id,version,details,created_at) VALUES(?,?,?,?,?,?)",
+                    (record_id, "plan_change_requested", actor_id, int(row["version"]), json.dumps(details, ensure_ascii=False, sort_keys=True), now),
+                )
+                connection.commit()
+        except sqlite3.IntegrityError as exc:
+            raise Conflict("该贷款已有待审的方案变更申请") from exc
+        return self.get_plan_change(record_id, change_id)
+
+    def get_plan_change(self, record_id: int, change_id: int) -> Dict[str, Any]:
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM plan_changes WHERE id=? AND record_id=?", (change_id, record_id)).fetchone()
+        if row is None:
+            raise NotFound("变更申请不存在")
+        return dict(row)
+
+    def list_plan_changes(self, record_id: Optional[int] = None, status: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
+        limit = max(1, min(int(limit), 500))
+        clauses = []
+        params: List[Any] = []
+        if record_id is not None:
+            clauses.append("record_id=?")
+            params.append(record_id)
+        if status:
+            clauses.append("status=?")
+            params.append(status)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        with self._connect() as connection:
+            rows = connection.execute("SELECT * FROM plan_changes" + where + " ORDER BY id DESC LIMIT ?", (*params, limit)).fetchall()
+        return [dict(row) for row in rows]
+
+    def decide_plan_change(self, record_id: int, change_id: int, expected_version: int, status: str, decision_note: str, payload: Dict[str, Any], actor_id: str, audit_details: Dict[str, Any]) -> Dict[str, Any]:
+        now = _now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT version FROM records WHERE id=?", (record_id,)).fetchone()
+            if row is None:
+                connection.rollback()
+                raise NotFound("记录不存在")
+            change = connection.execute("SELECT status FROM plan_changes WHERE id=? AND record_id=?", (change_id, record_id)).fetchone()
+            if change is None:
+                connection.rollback()
+                raise NotFound("变更申请不存在")
+            if change["status"] != "pending":
+                connection.rollback()
+                raise Conflict("该申请已处理")
+            if int(row["version"]) != int(expected_version):
+                connection.rollback()
+                raise Conflict("版本冲突，请刷新后重试")
+            version = int(expected_version) + 1
+            connection.execute(
+                "UPDATE plan_changes SET status=?, decided_by=?, decision_note=?, decided_at=? WHERE id=?",
+                (status, actor_id, decision_note, now, change_id),
+            )
+            connection.execute(
+                "UPDATE records SET version=?, payload=?, updated_by=?, updated_at=? WHERE id=?",
+                (version, json.dumps(payload, ensure_ascii=False, sort_keys=True), actor_id, now, record_id),
+            )
+            connection.execute(
+                "INSERT INTO audit_events(record_id,action,actor_id,version,details,created_at) VALUES(?,?,?,?,?,?)",
+                (record_id, "plan_change_" + status, actor_id, version, json.dumps(audit_details, ensure_ascii=False, sort_keys=True), now),
+            )
+            connection.commit()
+        return self.get_plan_change(record_id, change_id)
 
     def audit_timeline(self, record_id: int) -> List[Dict[str, Any]]:
         self.get(record_id)

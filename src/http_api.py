@@ -12,6 +12,9 @@ from .domain import Actor, DomainError, PermissionDenied, ValidationError
 RECORD_RE = re.compile(r"^/api/records/(\d+)$")
 ACTION_RE = re.compile(r"^/api/records/(\d+)/actions/([a-z_]+)$")
 AUDIT_RE = re.compile(r"^/api/records/(\d+)/audit$")
+PLAN_CHANGES_RE = re.compile(r"^/api/records/(\d+)/plan-changes$")
+PLAN_CHANGE_RE = re.compile(r"^/api/records/(\d+)/plan-changes/(\d+)$")
+PLAN_CHANGE_REVIEW_RE = re.compile(r"^/api/records/(\d+)/plan-changes/(\d+)/review$")
 
 
 def make_handler(service: Any, static_dir: Path):
@@ -84,6 +87,21 @@ def make_handler(service: Any, static_dir: Path):
                 if match:
                     self._send(200, {"items": service.timeline(self._actor(), int(match.group(1)))})
                     return
+                match = PLAN_CHANGE_RE.match(parsed.path)
+                if match:
+                    self._send(200, service.get_plan_change(self._actor(), int(match.group(1)), int(match.group(2))))
+                    return
+                match = PLAN_CHANGES_RE.match(parsed.path)
+                if match:
+                    query = parse_qs(parsed.query)
+                    items = service.list_plan_changes(self._actor(), record_id=int(match.group(1)), status=query.get("status", [None])[0], limit=int(query.get("limit", ["100"])[0]))
+                    self._send(200, {"items": items})
+                    return
+                if parsed.path == "/api/plan-changes":
+                    query = parse_qs(parsed.query)
+                    items = service.list_plan_changes(self._actor(), status=query.get("status", [None])[0], limit=int(query.get("limit", ["100"])[0]))
+                    self._send(200, {"items": items})
+                    return
                 if parsed.path == "/api/stats":
                     self._send(200, service.stats(self._actor()))
                     return
@@ -106,6 +124,19 @@ def make_handler(service: Any, static_dir: Path):
                         raise ValidationError("expected_version必须是整数")
                     record = service.act(self._actor(), int(match.group(1)), version, match.group(2), body.get("data", {}))
                     self._send(200, record)
+                    return
+                match = PLAN_CHANGE_REVIEW_RE.match(parsed.path)
+                if match:
+                    version = body.get("expected_version")
+                    if not isinstance(version, int):
+                        raise ValidationError("expected_version必须是整数")
+                    change = service.review_plan_change(self._actor(), int(match.group(1)), int(match.group(2)), version, body.get("data", {}))
+                    self._send(200, change)
+                    return
+                match = PLAN_CHANGES_RE.match(parsed.path)
+                if match:
+                    change = service.request_plan_change(self._actor(), int(match.group(1)), body.get("data", {}))
+                    self._send(201, change)
                     return
                 self._send(404, {"error": "not_found", "message": "路径不存在"})
             except Exception as exc:

@@ -1,20 +1,23 @@
 """住房贷款纾困申请与履约跟踪领域规则与状态转换。"""
-from typing import Any, Dict, Iterable, Tuple
+from typing import Any, Dict, Iterable, List, Tuple
 
-from .domain import Actor, Conflict, ValidationError, boolean, choice, integer, number, text, text_list
+from .domain import Actor, Conflict, ValidationError, boolean, choice, date_text, integer, number, optional_text, text, text_list
 
 
 INITIAL_STATE = "submitted"
 CREATE_ROLES = {'intake_officer'}
 ACTION_ROLES = {'assess': {'intake_officer'}, 'approve': {'underwriter'}, 'activate': {'servicer'}, 'cure': {'servicer'}, 'default': {'servicer'}}
 TRANSITIONS = {'assess': {'submitted': 'assessed'}, 'approve': {'assessed': 'approved'}, 'activate': {'approved': 'active'}, 'cure': {'active': 'cured'}, 'default': {'active': 'defaulted'}}
+SUBMIT_MODIFICATION_ROLES = {'servicer'}
+REVIEW_MODIFICATION_ROLES = {'underwriter'}
+MODIFICATION_STATUSES = ("pending", "approved", "rejected")
 
 
 class DomainRules:
     INITIAL_STATE = INITIAL_STATE
 
     def known_role(self, role: str) -> bool:
-        all_roles = set(CREATE_ROLES)
+        all_roles = set(CREATE_ROLES) | set(SUBMIT_MODIFICATION_ROLES) | set(REVIEW_MODIFICATION_ROLES)
         for roles in ACTION_ROLES.values():
             all_roles.update(roles)
         return role == "admin" or role in all_roles
@@ -24,6 +27,12 @@ class DomainRules:
 
     def role_can_action(self, role: str, action: str) -> bool:
         return role == "admin" or role in ACTION_ROLES.get(action, set())
+
+    def role_can_submit_modification(self, role: str) -> bool:
+        return role == "admin" or role in SUBMIT_MODIFICATION_ROLES
+
+    def role_can_review_modification(self, role: str) -> bool:
+        return role == "admin" or role in REVIEW_MODIFICATION_ROLES
 
     def validate_create(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         p = dict(payload)
@@ -91,6 +100,8 @@ class DomainRules:
             if not boolean(data, "borrower_ack"):
                 raise ValidationError("借款人尚未确认方案")
             changes["borrower_ack"] = True
+            changes["current_payment"] = float(p["approved_payment"])
+            changes["current_remaining_months"] = int(p["approved_months"])
             summary = "纾困方案生效"
         elif action == "cure":
             if not boolean(data, "arrears_cleared"):
@@ -102,3 +113,67 @@ class DomainRules:
             summary = "纾困方案违约"
         p.update(changes)
         return new_state, p, summary or ("已执行%s" % action)
+
+    def check_modification_allowed(self, record: Dict[str, Any]) -> None:
+        if record["state"] != "active":
+            raise Conflict("仅履约中的纾困方案可申请变更")
+
+    def validate_modification(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "new_payment": number(data, "new_payment", 0),
+            "remaining_months": integer(data, "remaining_months", 1),
+            "reason": text(data, "reason"),
+            "effective_date": date_text(data, "effective_date"),
+        }
+
+    def validate_review_decision(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        if "approve" not in data:
+            raise ValidationError("approve不能为空")
+        return {"approve": boolean(data, "approve"), "review_note": optional_text(data, "review_note")}
+
+    @staticmethod
+    def current_plan(payload: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "payment": float(payload.get("current_payment", payload.get("approved_payment", 0.0))),
+            "remaining_months": int(payload.get("current_remaining_months", payload.get("approved_months", 0))),
+        }
+
+    def evaluate_modification(self, record: Dict[str, Any], modification: Dict[str, Any]) -> List[str]:
+        plan = self.current_plan(record["payload"])
+        original_months = int(record["payload"].get("approved_months", plan["remaining_months"]))
+        problems: List[str] = []
+        if float(modification["new_payment"]) > plan["payment"]:
+            problems.append("新月供高于现方案")
+        if int(modification["remaining_months"]) > original_months:
+            problems.append("剩余期数超过原期限")
+        return problems
+
+    def apply_modification(self, record: Dict[str, Any], modification: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        p = dict(record["payload"])
+        before = self.current_plan(p)
+        p["current_payment"] = float(modification["new_payment"])
+        p["current_remaining_months"] = int(modification["remaining_months"])
+        p["current_effective_date"] = modification["effective_date"]
+        details = {
+            "modification_id": modification["id"],
+            "before": before,
+            "after": self.current_plan(p),
+            "effective_date": modification["effective_date"],
+            "reason": modification["reason"],
+        }
+        return p, details
+
+    def modification_rejection_details(self, record: Dict[str, Any], modification: Dict[str, Any], problems: List[str] = None) -> Dict[str, Any]:
+        details = {
+            "modification_id": modification["id"],
+            "request": {
+                "new_payment": float(modification["new_payment"]),
+                "remaining_months": int(modification["remaining_months"]),
+                "reason": modification["reason"],
+                "effective_date": modification["effective_date"],
+            },
+            "current_plan": self.current_plan(record["payload"]),
+        }
+        if problems:
+            details["problems"] = list(problems)
+        return details

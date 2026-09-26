@@ -1,5 +1,6 @@
 """领域基础类型与输入校验。"""
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Dict, List
 
 
@@ -78,6 +79,15 @@ def choice(data: Dict[str, Any], key: str, allowed: List[str]) -> str:
     value = text(data, key)
     if value not in allowed:
         raise ValidationError("%s只能是%s" % (key, "/".join(allowed)))
+    return value
+
+
+def date_text(data: Dict[str, Any], key: str) -> str:
+    value = text(data, key)
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+    except ValueError as exc:
+        raise ValidationError("%s必须是YYYY-MM-DD格式的日期" % key) from exc
     return value
 
 
